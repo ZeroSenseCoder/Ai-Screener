@@ -611,42 +611,71 @@ def lbo_model(
 # ── Model 14: Black-Scholes (Real Options / Warrant Pricing) ──────────────────
 
 def black_scholes(
-    spot: float,       # current stock price (S)
-    strike: float,     # exercise price (K)
-    volatility: float, # annualized vol (σ)
-    risk_free: float,  # risk-free rate (r)
-    time_years: float, # time to expiry in years (T)
+    spot: float,              # current stock price (S)
+    strike: float,            # exercise price (K)
+    volatility: float,        # annualized vol (σ)
+    risk_free: float,         # risk-free rate (r)
+    time_years: float,        # time to expiry in years (T)
     option_type: str = "call",
+    dividend_yield: float = 0.0,  # continuous dividend yield (q) — Merton model
 ) -> dict:
+    """Black-Scholes-Merton European option pricing with continuous dividend yield.
+    For non-dividend stocks pass dividend_yield=0 (reduces to plain BSM).
+    """
     if time_years <= 0 or volatility <= 0:
         return {"error": "Invalid time or volatility"}
 
-    d1 = (math.log(spot / strike) + (risk_free + 0.5 * volatility ** 2) * time_years) / (volatility * math.sqrt(time_years))
-    d2 = d1 - volatility * math.sqrt(time_years)
+    q = dividend_yield or 0.0
+    sqrt_T = math.sqrt(time_years)
+    disc_q = math.exp(-q * time_years)          # e^(-qT)
+    disc_r = math.exp(-risk_free * time_years)  # e^(-rT)
+    npdf   = lambda x: math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+    # Merton d1 includes (r − q + σ²/2)
+    d1 = (math.log(spot / strike) + (risk_free - q + 0.5 * volatility ** 2) * time_years) / (volatility * sqrt_T)
+    d2 = d1 - volatility * sqrt_T
+
+    Nd1  = _norm_cdf(d1);  Nd2  = _norm_cdf(d2)
+    Nnd1 = _norm_cdf(-d1); Nnd2 = _norm_cdf(-d2)
+    nd1  = npdf(d1)
 
     if option_type == "call":
-        price = spot * _norm_cdf(d1) - strike * math.exp(-risk_free * time_years) * _norm_cdf(d2)
+        price = spot * disc_q * Nd1 - strike * disc_r * Nd2
     else:
-        price = strike * math.exp(-risk_free * time_years) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+        price = strike * disc_r * Nnd2 - spot * disc_q * Nnd1
 
-    delta = _norm_cdf(d1) if option_type == "call" else _norm_cdf(d1) - 1
-    gamma = math.exp(-0.5 * d1 ** 2) / (spot * volatility * math.sqrt(2 * math.pi * time_years))
-    theta = (
-        -spot * math.exp(-0.5 * d1 ** 2) * volatility / (2 * math.sqrt(2 * math.pi * time_years))
-        - risk_free * strike * math.exp(-risk_free * time_years) * _norm_cdf(d2 if option_type == "call" else -d2) * (-1 if option_type == "put" else 1)
-    ) / 365
+    # Greeks (Merton-adjusted)
+    delta = disc_q * Nd1 if option_type == "call" else disc_q * (Nd1 - 1)
+    gamma = disc_q * nd1 / (spot * volatility * sqrt_T)
+    # Theta (per calendar day)
+    if option_type == "call":
+        theta = (
+            -spot * disc_q * nd1 * volatility / (2 * sqrt_T)
+            - risk_free * strike * disc_r * Nd2
+            + q * spot * disc_q * Nd1
+        ) / 365
+    else:
+        theta = (
+            -spot * disc_q * nd1 * volatility / (2 * sqrt_T)
+            + risk_free * strike * disc_r * Nnd2
+            - q * spot * disc_q * Nnd1
+        ) / 365
+    vega     = spot * disc_q * nd1 * sqrt_T / 100
+    rho_call = strike * time_years * disc_r * (Nd2 if option_type == "call" else -Nnd2) / 100
 
     return {
-        "option_price": round(price, 4),
+        "option_price":    round(price, 4),
         "intrinsic_value": round(price, 4),
-        "upside_pct": None,
-        "d1": round(d1, 4),
-        "d2": round(d2, 4),
-        "delta": round(delta, 4),
-        "gamma": round(gamma, 6),
-        "theta_daily": round(theta, 4),
-        "n_d1": round(_norm_cdf(d1), 4),
-        "n_d2": round(_norm_cdf(d2), 4),
+        "upside_pct":      None,
+        "d1":              round(d1, 4),
+        "d2":              round(d2, 4),
+        "delta":           round(delta, 4),
+        "gamma":           round(gamma, 6),
+        "theta_daily":     round(theta, 4),
+        "vega":            round(vega, 4),
+        "rho":             round(rho_call, 4),
+        "n_d1":            round(Nd1, 4),
+        "n_d2":            round(Nd2, 4),
     }
 
 
@@ -776,25 +805,37 @@ def vc_method(
 # ── Model 19: Precedent Transactions ──────────────────────────────────────────
 
 def precedent_transactions(revenue, ebitda, ev_ebitda_multiple, deal_premium, synergies_pct, shares, debt, cash, price):
-    """Precedent transaction analysis - M&A deal implied value."""
-    if not ebitda or ebitda <= 0:
-        return {"error": "EBITDA required"}
-    base_ev = ebitda * ev_ebitda_multiple
-    premium_value = base_ev * deal_premium
-    synergy_value = ebitda * synergies_pct
-    total_ev = base_ev + premium_value + synergy_value
-    equity_value = total_ev - (debt or 0) + (cash or 0)
+    """
+    Precedent transaction analysis — acquisition-premium approach.
+
+    Uses market price as base to avoid standalone vs consolidated EBITDA mismatch
+    (screener.in filing data is standalone; yfinance EV is consolidated — applying
+    a deal multiple to standalone EBITDA produces grossly understated values).
+
+    Formula:
+        Acquisition Value (equity) = price × shares × (1 + deal_premium)
+        Synergy EV                 = ebitda × synergies_pct × ev_ebitda_multiple
+        Total Offer Equity         = Acquisition Value + Synergy EV
+        Implied Price              = Total Offer Equity / Shares
+    """
+    if not price or price <= 0:
+        return {"error": "Current price required"}
     if not shares or shares <= 0:
         return {"error": "Shares outstanding required"}
-    iv = equity_value / shares
+
+    mktcap       = price * shares
+    acq_equity   = mktcap * (1.0 + deal_premium)
+    synergy_ev   = (ebitda or 0) * synergies_pct * ev_ebitda_multiple
+    total_equity = acq_equity + synergy_ev
+    iv           = total_equity / shares
+
     return {
-        "intrinsic_value": iv,
-        "upside_pct": (iv - price) / price * 100 if price else None,
-        "base_ev": base_ev,
-        "deal_premium_value": premium_value,
-        "synergy_value": synergy_value,
-        "total_ev": total_ev,
-        "equity_value": equity_value,
+        "intrinsic_value":  iv,
+        "upside_pct":       (iv - price) / price * 100 if price else None,
+        "acquisition_value": acq_equity,
+        "synergy_ev":        synergy_ev,
+        "total_offer_equity": total_equity,
+        "deal_premium_applied": deal_premium,
     }
 
 
@@ -845,15 +886,21 @@ def excess_earnings(net_income, total_assets, book_value, fair_return_rate, disc
 
 # ── Model 22: CFROI ────────────────────────────────────────────────────────────
 
-def cfroi_model(operating_cf, asset_base, asset_life, required_return, shares, debt, cash, price):
-    """CFROI: Cash Flow Return on Investment vs cost of capital."""
-    if not asset_base or asset_base <= 0:
-        return {"error": "Asset base required"}
-    cfroi_rate = (operating_cf or 0) / asset_base
+def cfroi_model(operating_cf, asset_base, asset_life, required_return, shares, debt, cash, price,
+                invested_capital=0):
+    """CFROI = Operating Cash Flow / Capital Employed.
+    Capital Employed = Invested Capital (Equity + Financial Debt) when provided,
+    otherwise falls back to Total Assets (asset_base).
+    EV = Capital Employed + PV of excess economic returns over asset life.
+    """
+    capital_employed = (invested_capital or 0) if (invested_capital or 0) > 0 else (asset_base or 0)
+    if not capital_employed or capital_employed <= 0:
+        return {"error": "Capital employed / asset base required"}
+    cfroi_rate = (operating_cf or 0) / capital_employed
     spread = cfroi_rate - required_return
     annuity = (1 - (1 + required_return) ** (-asset_life)) / required_return if required_return > 0 else asset_life
-    value_from_spread = asset_base * spread * annuity
-    enterprise_value = asset_base + value_from_spread
+    value_from_spread = capital_employed * spread * annuity
+    enterprise_value = capital_employed + value_from_spread
     equity_value = enterprise_value - (debt or 0) + (cash or 0)
     if not shares or shares <= 0:
         return {"error": "Shares outstanding required"}
@@ -862,6 +909,7 @@ def cfroi_model(operating_cf, asset_base, asset_life, required_return, shares, d
         "intrinsic_value": iv,
         "upside_pct": (iv - price) / price * 100 if price else None,
         "cfroi_rate": round(cfroi_rate * 100, 2),
+        "capital_employed": round(capital_employed),
         "required_return_pct": round(required_return * 100, 2),
         "spread_pct": round(spread * 100, 2),
         "enterprise_value": enterprise_value,
@@ -872,20 +920,35 @@ def cfroi_model(operating_cf, asset_base, asset_life, required_return, shares, d
 # ── Model 23: Revenue Multiple ─────────────────────────────────────────────────
 
 def revenue_multiple(revenue, ev_revenue_multiple, shares, debt, cash, price):
-    """Revenue Multiple: EV = Revenue × Multiple."""
+    """
+    EV/Revenue Multiple valuation.
+
+    EV/Revenue is an ENTERPRISE VALUE multiple (not P/S).
+    Equity bridge: Equity = EV − Net Debt.
+
+    Formula:
+        Implied EV    = Revenue × EV/Revenue_Multiple
+        Net Debt      = Total Debt − Cash
+        Equity Value  = Implied EV − Net Debt
+        Implied Price = Equity Value / Shares
+    """
     if not revenue:
         return {"error": "Revenue required"}
-    ev = revenue * ev_revenue_multiple
-    equity_value = ev - (debt or 0) + (cash or 0)
     if not shares or shares <= 0:
         return {"error": "Shares outstanding required"}
-    iv = equity_value / shares
+
+    net_debt     = (debt or 0) - (cash or 0)
+    ev           = revenue * ev_revenue_multiple
+    equity_value = ev - net_debt
+    iv           = equity_value / shares
+
     return {
-        "intrinsic_value": iv,
-        "upside_pct": (iv - price) / price * 100 if price else None,
-        "enterprise_value": ev,
-        "equity_value": equity_value,
-        "multiple_used": ev_revenue_multiple,
+        "intrinsic_value":    iv,
+        "upside_pct":         (iv - price) / price * 100 if price else None,
+        "enterprise_value":   ev,
+        "net_debt":           net_debt,
+        "equity_value":       equity_value,
+        "multiple_used":      ev_revenue_multiple,
     }
 
 
